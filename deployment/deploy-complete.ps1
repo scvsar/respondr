@@ -17,10 +17,10 @@
     The Azure resource group name to deploy to.
 
 .PARAMETER Location
-    The Azure region to deploy to (default: westus).
+    The Azure region to deploy to (default: eastus2).
 
 .PARAMETER Domain
-    The domain to use for the application (default: paincave.pro).
+    The domain to use for the application (default: rtreit.com).
 
 .PARAMETER SkipInfrastructure
     Skip the infrastructure deployment step.
@@ -32,11 +32,10 @@
     Disable OAuth2 proxy (default behavior is OAuth2 enabled). When specified, uses Application Gateway auth path.
 
 .EXAMPLE
-    .\deploy-complete.ps1 -ResourceGroupName "respondr" -Domain "paincave.pro"
+    .\deploy-complete.ps1 -ResourceGroupName "respondr" -Domain "rtreit.com"
     
 .EXAMPLE
-    .\deploy-complete.ps1 -ResourceGroupName "respondr" -Domain "paincave.pro" -UseOAuth2:$false
-    .\deploy-complete.ps1 -ResourceGroupName "respondr" -Domain "paincave.pro" -DisableOAuth2
+    .\deploy-complete.ps1 -ResourceGroupName "respondr" -Domain "rtreit.com" -DisableOAuth2
 #>
 
 param(
@@ -44,10 +43,10 @@ param(
     [string]$ResourceGroupName,
     
     [Parameter(Mandatory=$false)]
-    [string]$Location = "westus",
+    [string]$Location = "eastus2",
     
     [Parameter(Mandatory=$false)]
-    [string]$Domain = "paincave.pro",
+    [string]$Domain = "rtreit.com",
 
     [Parameter(Mandatory=$false)]
     [string]$Namespace = "respondr",
@@ -57,6 +56,9 @@ param(
 
     [Parameter(Mandatory=$false)]
     [string]$ImageTag = "latest",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$AppName,
     
     [Parameter(Mandatory=$false)]
     [switch]$SkipInfrastructure,
@@ -70,6 +72,10 @@ param(
     [Parameter(Mandatory=$false)]
     [switch]$DryRun,
 
+    # Optional: Pass Service Tree ID for app registration attribution (SFI tenants)
+    [Parameter(Mandatory=$false)]
+    [string]$ServiceTreeId,
+
     [Parameter(Mandatory=$false)]
     [switch]$SetupAcrWebhook,
 
@@ -79,9 +85,18 @@ param(
     [string]$GithubRepo,
     [Parameter(Mandatory=$false)]
     [string]$GithubBranch = "main"
+    ,
+    # Optional: Auth policy inputs for values generation
+    [Parameter(Mandatory=$false)]
+    [string[]]$AllowedEmailDomains,
+    [Parameter(Mandatory=$false)]
+    [string[]]$AllowedAdminUsers
 )
 
 $hostname = "$HostPrefix.$Domain"
+
+# Resolve app name early for downstream steps
+$resolvedAppName = if ($AppName -and $AppName.Trim()) { $AppName } else { $Namespace }
 
 # Derive internal flag (default true unless -DisableOAuth2 provided)
 $UseOAuth2 = -not $DisableOAuth2.IsPresent
@@ -142,7 +157,7 @@ Write-Host "`n🔧 Step 2: Post-deployment Configuration..." -ForegroundColor Ye
 Write-Host "=============================================" -ForegroundColor Yellow
 
 if (-not $DryRun) {
-    & (Join-Path $PSScriptRoot 'post-deploy.ps1') -ResourceGroupName $ResourceGroupName -Location $Location
+    & (Join-Path $PSScriptRoot 'post-deploy.ps1') -ResourceGroupName $ResourceGroupName -Location $Location -Namespace $Namespace -AppName $resolvedAppName
     Test-LastCommand "Post-deployment configuration failed"
     Write-Host "Post-deployment configuration completed" -ForegroundColor Green
 } else {
@@ -198,12 +213,12 @@ if (-not $DryRun) {
             --name httpsPort `
             --port 443 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            # Secondary guard: if failure due to duplicate, continue; else abort
+            # Secondary guard: if failure due to duplicate or already in use, continue; else abort
             $dupCheck = az network application-gateway frontend-port list --gateway-name $appGwName --resource-group $mcResourceGroup -o json 2>$null | ConvertFrom-Json
             if ($dupCheck | Where-Object { $_.port -eq 443 }) {
                 Write-Host "Detected existing 443 port after create attempt; proceeding idempotently" -ForegroundColor Yellow
             } else {
-                Test-LastCommand "Failed to add HTTPS port"
+                Write-Warning "HTTPS port creation failed and port 443 not found in list; continuing—cert-manager will still provision TLS on ingress."
             }
         } else {
             Write-Host "HTTPS port added" -ForegroundColor Green
@@ -222,7 +237,14 @@ if ($UseOAuth2) {
     Write-Host "===============================================" -ForegroundColor Yellow
 
     if (-not $DryRun) {
-    & (Join-Path $PSScriptRoot 'setup-oauth2.ps1') -ResourceGroupName $ResourceGroupName -Domain $Domain -Namespace $Namespace -HostPrefix $HostPrefix
+        $oauth2Args = @{
+            ResourceGroupName = $ResourceGroupName
+            Domain            = $Domain
+            Namespace         = $Namespace
+            HostPrefix        = $HostPrefix
+        }
+        if ($ServiceTreeId) { $oauth2Args.ServiceTreeId = $ServiceTreeId }
+        & (Join-Path $PSScriptRoot 'setup-oauth2.ps1') @oauth2Args
         Test-LastCommand "OAuth2 authentication setup failed"
         Write-Host "OAuth2 authentication configured successfully" -ForegroundColor Green
     } else {
@@ -307,7 +329,37 @@ Write-Host "===========================================" -ForegroundColor Yellow
 if (-not $DryRun) {
     # Create secrets using the dedicated script
     Write-Host "Generating application secrets..." -ForegroundColor Yellow
-    & (Join-Path $PSScriptRoot 'create-secrets.ps1') -ResourceGroupName $ResourceGroupName -Namespace $Namespace
+    # Determine app name early (prefer explicit; else from values; else fallback to namespace)
+    $resolvedAppName = if ($AppName) { $AppName } else { $null }
+    $valuesPathEarly = Join-Path $PSScriptRoot 'values.yaml'
+    if (-not $resolvedAppName -and (Test-Path $valuesPathEarly)) {
+        try {
+            $valuesRawEarly = Get-Content $valuesPathEarly -Raw
+            $appNameMatch = $valuesRawEarly | Select-String 'appName: "([^"]+)"'
+            if ($appNameMatch -and $appNameMatch.Matches -and $appNameMatch.Matches.Count -gt 0) {
+                $resolvedAppName = $appNameMatch.Matches[0].Groups[1].Value
+            }
+        } catch {}
+    }
+    if (-not $resolvedAppName) { $resolvedAppName = $Namespace }
+
+    # If a secrets.yaml exists and contains a distinct name, align to it to avoid mismatch
+    $secretsPathPeek = Join-Path $PSScriptRoot 'secrets.yaml'
+    if (Test-Path $secretsPathPeek) {
+        try {
+            $secretsRaw = Get-Content $secretsPathPeek -Raw
+            $nameMatch = $secretsRaw | Select-String '(?m)^\s*name:\s*([A-Za-z0-9-]+)-secrets\s*$'
+            if ($nameMatch -and $nameMatch.Matches.Count -gt 0) {
+                $secretBase = $nameMatch.Matches[0].Groups[1].Value
+                if ($secretBase -and ($secretBase -ne $resolvedAppName)) {
+                    Write-Host "Aligning app name to secrets file base '$secretBase'" -ForegroundColor Yellow
+                    $resolvedAppName = $secretBase
+                }
+            }
+        } catch {}
+    }
+
+    & (Join-Path $PSScriptRoot 'create-secrets.ps1') -ResourceGroupName $ResourceGroupName -Namespace $Namespace -AppName $resolvedAppName
     Test-LastCommand "Secrets creation failed"
     Write-Host "Application secrets created successfully" -ForegroundColor Green
 
@@ -318,18 +370,38 @@ if (-not $DryRun) {
         kubectl apply -f $secretsPath -n $Namespace | Out-Null
         Test-LastCommand "Failed to apply secrets.yaml to cluster"
         # Verify secret exists
-        if (-not (kubectl get secret respondr-secrets -n $Namespace -o name 2>$null)) {
-            Write-Error "Secret respondr-secrets not found in namespace '$Namespace' after apply"
+        $primarySecretName = "$resolvedAppName-secrets"
+        $null = kubectl get secret $primarySecretName -n $Namespace -o name
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Secret $primarySecretName not found in namespace '$Namespace' after apply"
             exit 1
         }
-        Write-Host "✅ Kubernetes secret 'respondr-secrets' present in namespace '$Namespace'" -ForegroundColor Green
+        Write-Host "✅ Kubernetes secret '$primarySecretName' present in namespace '$Namespace'" -ForegroundColor Green
+
+        # Compatibility: if some manifests expect 'respondr-secrets', ensure an alias exists
+        $compatSecretName = 'respondr-secrets'
+        $null = kubectl get secret $compatSecretName -n $Namespace -o name
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Creating compatibility secret '$compatSecretName' from '$primarySecretName'..." -ForegroundColor Yellow
+            $srcSecretYaml = kubectl get secret $primarySecretName -n $Namespace -o yaml
+            if ($LASTEXITCODE -eq 0 -and $srcSecretYaml) {
+                $dupYaml = $srcSecretYaml -replace '(?m)^  name:\s*.+-secrets\s*$', "  name: $compatSecretName"
+                $dupYaml | kubectl apply -f - -n $Namespace | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "✅ Created '$compatSecretName' for compatibility" -ForegroundColor Green
+                } else {
+                    Write-Warning "Failed to create compatibility secret '$compatSecretName'"
+                }
+            }
+        }
     } else {
         Write-Warning "secrets.yaml not found at $secretsPath"
         
-        # For non-main namespaces (e.g., preprod), try copying secrets from main namespace
+        # For non-main namespaces (e.g., preprod), try copying secrets from primary namespace
         if ($Namespace -ne "respondr") {
             Write-Host "Attempting to copy secrets from main namespace 'respondr' to '$Namespace'..." -ForegroundColor Yellow
-            $mainSecret = kubectl get secret respondr-secrets -n respondr -o yaml 2>$null
+            $resolvedAppName = if ($AppName) { $AppName } else { $Namespace }
+            $mainSecret = kubectl get secret "$resolvedAppName-secrets" -n respondr -o yaml 2>$null
             if ($mainSecret) {
                 # Replace namespace and apply to target namespace
                 $preprodSecret = $mainSecret -replace 'namespace: respondr', "namespace: $Namespace"
@@ -356,14 +428,44 @@ Write-Host "=================================================================" -
 if (-not $DryRun) {
     # Generate values.yaml from current Azure environment
     Write-Host "Generating values.yaml from current Azure environment..." -ForegroundColor Yellow
-    & (Join-Path $PSScriptRoot 'generate-values.ps1') -ResourceGroupName $ResourceGroupName -Domain $Domain -Namespace $Namespace -HostPrefix $HostPrefix -ImageTag $ImageTag
+    $genArgs = @{
+        ResourceGroupName = $ResourceGroupName
+        Domain            = $Domain
+        Namespace         = $Namespace
+        HostPrefix        = $HostPrefix
+        ImageTag          = $ImageTag
+    }
+    # Always pass the resolved app name so values.yaml stays aligned with secrets/app resources
+    $genArgs.AppName = $resolvedAppName
+    if ($AllowedEmailDomains) { $genArgs.AllowedEmailDomains = $AllowedEmailDomains }
+    if ($AllowedAdminUsers)   { $genArgs.AllowedAdminUsers   = $AllowedAdminUsers }
+    & (Join-Path $PSScriptRoot 'generate-values.ps1') @genArgs
     Test-LastCommand "Failed to generate values from environment"
     Write-Host "Values generated successfully" -ForegroundColor Green
     
+    # If OAuth2 is disabled, force useOAuth2: "false" in values.yaml so template removes oauth2-proxy
+    if (-not $UseOAuth2) {
+        try {
+            $valuesPath = Join-Path $PSScriptRoot 'values.yaml'
+            if (Test-Path $valuesPath) {
+                $raw = Get-Content $valuesPath -Raw
+                if ($raw -match '(?m)^\s*useOAuth2\s*:') {
+                    $raw = [regex]::Replace($raw, '(?m)^\s*useOAuth2\s*:\s*"?[^"\r\n]*"?', 'useOAuth2: "false"')
+                } else {
+                    $raw += "`nuseOAuth2: `"false`"`n"
+                }
+                $raw | Out-File -FilePath $valuesPath -Encoding UTF8
+                Write-Host "Set useOAuth2=false in values.yaml (DisableOAuth2 requested)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Warning "Could not update useOAuth2 in values.yaml: $_"
+        }
+    }
+
     # Process template to generate deployment file
     Write-Host "Processing deployment template..." -ForegroundColor Yellow
-    $templateFile = "respondr-k8s-unified-template.yaml"
-    $outputFile = "respondr-k8s-generated.yaml"
+    $templateFile = Join-Path $PSScriptRoot "respondr-k8s-unified-template.yaml"
+    $outputFile = Join-Path $PSScriptRoot "respondr-k8s-generated.yaml"
     
     & (Join-Path $PSScriptRoot 'process-template.ps1') -TemplateFile $templateFile -OutputFile $outputFile
     Test-LastCommand "Failed to process deployment template"
@@ -386,7 +488,10 @@ if (-not $DryRun) {
         $acrName = ($valuesContent | Select-String "acrName: `"([^`"]+)`"").Matches[0].Groups[1].Value
         $acrLoginServer = ($valuesContent | Select-String "acrLoginServer: `"([^`"]+)`"").Matches[0].Groups[1].Value
         $imageTag = ($valuesContent | Select-String "imageTag: `"([^`"]+)`"").Matches[0].Groups[1].Value
-        $fullImageName = "$acrLoginServer/respondr:$imageTag"
+    # Determine app name from values.yaml for tagging
+    $appNameFromValues = ($valuesContent | Select-String 'appName: "([^"]+)"').Matches[0].Groups[1].Value
+    if (-not $appNameFromValues) { $appNameFromValues = 'respondr' }
+    $fullImageName = "$acrLoginServer/${appNameFromValues}:$imageTag"
         
         # Navigate to project root
         $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -413,7 +518,7 @@ if (-not $DryRun) {
             }
             
             # Build and push Docker image with correct tag
-            docker build -t "respondr:$imageTag" -t $fullImageName .
+            docker build -t "${appNameFromValues}:$imageTag" -t $fullImageName .
             Test-LastCommand "Docker build failed"
             
             docker push $fullImageName
@@ -422,6 +527,25 @@ if (-not $DryRun) {
             Write-Host "Docker image built and pushed successfully" -ForegroundColor Green
         } finally {
             Set-Location $originalLocation
+        }
+    }
+    else {
+        # Even if skipping build, ensure AKS has pull permissions to ACR
+        try {
+            $valuesContent = Get-Content "values.yaml" -Raw
+            $acrName = ($valuesContent | Select-String 'acrName: "([^"]+)"').Matches[0].Groups[1].Value
+            Write-Host "Ensuring AKS cluster can pull from ACR (skip build path)..." -ForegroundColor Yellow
+            $aksCluster = az aks list -g $ResourceGroupName --query "[0].name" -o tsv
+            if ($aksCluster) {
+                az aks update -g $ResourceGroupName -n $aksCluster --attach-acr $acrName | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "✅ ACR attached to AKS cluster" -ForegroundColor Green
+                } else {
+                    Write-Warning "Failed to attach ACR to AKS (may already be attached)"
+                }
+            }
+        } catch {
+            Write-Warning "Could not ensure AKS has pull permission to ACR: $_"
         }
     }
     
@@ -441,22 +565,54 @@ if (-not $DryRun) {
     # Deploy the generated application configuration
     Write-Host "Deploying application..." -ForegroundColor Yellow
     # Preflight: ensure required secret exists (defensive check)
-    if (-not (kubectl get secret respondr-secrets -n $Namespace -o name 2>$null)) {
-        Write-Error "Blocking deployment: required secret 'respondr-secrets' missing in namespace '$Namespace'"
+    # Re-evaluate app name late to align with processed template
+    $resolvedAppName = $null
+    try {
+        $valuesRawLate = Get-Content (Join-Path $PSScriptRoot 'values.yaml') -Raw
+        $m = ($valuesRawLate | Select-String 'appName: "([^"]+)"').Matches
+        if ($m.Count -gt 0) { $resolvedAppName = $m[0].Groups[1].Value }
+    } catch {}
+    if (-not $resolvedAppName) { $resolvedAppName = $Namespace }
+
+    # Ensure the "$resolvedAppName-secrets" exists; if missing, attempt a safe alignment ONLY if a single non-oauth2 candidate exists
+    $null = kubectl get secret "$resolvedAppName-secrets" -n $Namespace -o name 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        # Gather candidate app secrets (exclude oauth2 and TLS/helm/etc.)
+        $secretNames = kubectl get secret -n $Namespace -o jsonpath="{range .items[*]}{.metadata.name}{'\n'}{end}" 2>$null
+        $candidates = @()
+        if ($secretNames) {
+            foreach ($sn in ($secretNames -split "`n")) {
+                if ($sn -match '^[a-z0-9-]+-secrets$' -and $sn -ne 'oauth2-secrets' -and $sn -notmatch '^sh\.helm\.' -and $sn -notmatch 'tls' -and $sn.Trim()) {
+                    $candidates += $sn
+                }
+            }
+        }
+        if ($candidates.Count -eq 1) {
+            $candidateBase = $candidates[0].Substring(0, $candidates[0].Length - '-secrets'.Length)
+            Write-Host "Aligning to existing app secret '$($candidates[0])' for deployment (appName='$candidateBase')" -ForegroundColor Yellow
+            $resolvedAppName = $candidateBase
+        } elseif ($candidates.Count -gt 1) {
+            Write-Warning "Multiple app secrets found: $($candidates -join ', '). Not auto-aligning."
+        }
+    }
+    # Final check
+    $null = kubectl get secret "$resolvedAppName-secrets" -n $Namespace -o name
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Blocking deployment: required secret '$resolvedAppName-secrets' missing in namespace '$Namespace'"
         exit 1
     }
     kubectl apply -f (Join-Path $PSScriptRoot 'respondr-k8s-generated.yaml') -n $Namespace
     Test-LastCommand "Application deployment failed"
     
     # Wait for deployment to be ready
-    kubectl wait --for=condition=available --timeout=300s deployment/respondr-deployment -n $Namespace
+    kubectl wait --for=condition=available --timeout=300s deployment/$resolvedAppName-deployment -n $Namespace
     Test-LastCommand "Deployment did not become ready in time"
     
     Write-Host "Application deployed successfully" -ForegroundColor Green
     
     # Sync local .env file with Kubernetes secrets for development
     Write-Host "Syncing local .env file with deployed secrets..." -ForegroundColor Yellow
-    & (Join-Path $PSScriptRoot 'sync-env.ps1')
+    & (Join-Path $PSScriptRoot 'sync-env.ps1') -Namespace $Namespace -SecretName "$resolvedAppName-secrets"
     Write-Host "Local .env file updated for development use" -ForegroundColor Green
 } else {
     Write-Host "DRY RUN: Would deploy application with OAuth2 authentication" -ForegroundColor Cyan
@@ -469,7 +625,8 @@ Write-Host "=================================================" -ForegroundColor 
 if (-not $DryRun) {
     # Get ingress IP
     Start-Sleep -Seconds 10  # Wait for ingress to be ready
-    $ingressIp = kubectl get ingress respondr-ingress -n $Namespace -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
+    $ingressName = "$resolvedAppName-ingress"
+    $ingressIp = kubectl get ingress $ingressName -n $Namespace -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
     
     if ($ingressIp) {
         Write-Host "Application Gateway IP: $ingressIp" -ForegroundColor Green
@@ -529,10 +686,15 @@ Write-Host "=====================" -ForegroundColor Green
 
 if (-not $DryRun) {
     Write-Host "Infrastructure: Deployed" -ForegroundColor Green
-    Write-Host "AGIC & Authentication: Configured" -ForegroundColor Green
+    Write-Host "AGIC: Configured" -ForegroundColor Green
     Write-Host "Let's Encrypt Setup: Configured via cert-manager" -ForegroundColor Green
-    Write-Host "OAuth2 Authentication: Configured with Azure AD" -ForegroundColor Green
-    Write-Host "Application: Deployed to Kubernetes with OAuth2 proxy" -ForegroundColor Green
+    if ($UseOAuth2) {
+        Write-Host "OAuth2 Authentication: Configured with Azure AD" -ForegroundColor Green
+        Write-Host "Application: Deployed with oauth2-proxy" -ForegroundColor Green
+    } else {
+        Write-Host "OAuth2 Authentication: Disabled (using direct backend access)" -ForegroundColor Yellow
+        Write-Host "Application: Deployed without oauth2-proxy (service targets port 8000)" -ForegroundColor Green
+    }
     Write-Host ""
     Write-Host "🌐 Access Information:" -ForegroundColor Cyan
     Write-Host "  HTTP:  http://$hostname (redirects to HTTPS)" -ForegroundColor White
@@ -542,13 +704,17 @@ if (-not $DryRun) {
     Write-Host ""
     Write-Host "🪝 ACR Webhook: Configure ACR to POST to https://$hostname/internal/acr-webhook on push" -ForegroundColor Cyan
     Write-Host "  Header: X-ACR-Token with the value from deployment/secrets.yaml (ACR_WEBHOOK_TOKEN)" -ForegroundColor White
-    Write-Host "  Action: Push; Repo: respondr" -ForegroundColor White
+    Write-Host "  Action: Push; Repo: $resolvedAppName" -ForegroundColor White
     Write-Host "" 
-    Write-Host "🔐 Authentication:" -ForegroundColor Cyan
-    Write-Host "  - OAuth2 Proxy with Azure AD authentication is ENABLED" -ForegroundColor White
-    Write-Host "  - Users WILL be challenged to sign in with Entra/Azure AD" -ForegroundColor White
-    Write-Host "  - Authentication is handled by oauth2-proxy sidecar container" -ForegroundColor White
-    Write-Host "  - No application code changes required" -ForegroundColor White
+    if ($UseOAuth2) {
+        Write-Host "🔐 Authentication:" -ForegroundColor Cyan
+        Write-Host "  - OAuth2 Proxy with Azure AD authentication is ENABLED" -ForegroundColor White
+        Write-Host "  - Users WILL be challenged to sign in with Entra/Azure AD" -ForegroundColor White
+        Write-Host "  - Authentication is handled by oauth2-proxy sidecar container" -ForegroundColor White
+        Write-Host "  - No application code changes required" -ForegroundColor White
+    } else {
+        Write-Host "🔐 Authentication: DISABLED (direct access)" -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Host "🔒 SSL Certificates:" -ForegroundColor Cyan
     Write-Host "  - Let's Encrypt certificates will be automatically provisioned" -ForegroundColor White
@@ -564,7 +730,7 @@ if (-not $DryRun) {
     Write-Host ""
     Write-Host "Certificate Status Commands:" -ForegroundColor Cyan
     Write-Host "  kubectl get certificate -n $Namespace" -ForegroundColor White
-    Write-Host "  kubectl describe certificate respondr-tls-letsencrypt -n $Namespace" -ForegroundColor White
+    Write-Host "  kubectl describe certificate $resolvedAppName-tls-letsencrypt -n $Namespace" -ForegroundColor White
     Write-Host "  kubectl get certificaterequests -n $Namespace" -ForegroundColor White
 } else {
     Write-Host "DRY RUN completed - no changes made" -ForegroundColor Cyan
@@ -604,3 +770,8 @@ if ($SetupGithubOidc -and -not $DryRun) {
         }
     }
 }
+
+
+
+
+

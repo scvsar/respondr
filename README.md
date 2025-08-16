@@ -2,6 +2,14 @@
 
 A web app to track responses to Search and Rescue call‑outs. It listens to GroupMe webhooks, uses Azure OpenAI to extract responder details (vehicle and ETA), normalizes data, and shows it on a secure, real‑time dashboard.
 
+## Quick start
+
+- **Run tests**: `./run-tests.ps1`
+- **Start local dev**: `./dev-local.ps1 -Full` for backend+frontend or `./dev-local.ps1` for backend only
+- **Deploy**: `./deployment/deploy-complete.ps1 -ResourceGroupName <rg> -Domain <domain>`
+
+Archived scripts and experimental tests live under `_attic/` (see `_attic/WHY.md`).
+
 ## Highlights
 
 - Multi‑tenant Azure AD auth via OAuth2 Proxy sidecar (domain‑based allow list)
@@ -74,6 +82,33 @@ cd deployment
 
 # Include ACR webhook setup for automatic redeployments
 ./deploy-complete.ps1 -ResourceGroupName respondr -Domain "<your-domain>" -SetupAcrWebhook
+
+# OPTIONAL: Set auth policy up front (no manual edits to values.yaml)
+./deploy-complete.ps1 -ResourceGroupName respondr -Domain "<your-domain>" `
+  -AllowedEmailDomains "contoso.org","fabrikam.org" `
+  -AllowedAdminUsers "alice@contoso.org","bob@fabrikam.org"
+```
+
+Note this script has some additional parameters:
+```powershell
+./deploy-complete.ps1 `
+  -ResourceGroupName "respondr" `
+  -Location "westus" `
+  -Domain "rtreit.com" `
+  -Namespace "respondr" `
+  -HostPrefix "respondr" `
+  -ImageTag "latest" `
+  -SkipInfrastructure `
+  -SkipImageBuild `
+  -DisableOAuth2 `
+  -DryRun `
+  -ServiceTreeId "12345678-abcd-1234-5678-123456789abc" `
+  -SetupAcrWebhook `
+  -SetupGithubOidc `
+  -GithubRepo "scvsar/respondr" `
+  -GithubBranch "main" `
+  -AllowedEmailDomains "contoso.org","fabrikam.org" `
+  -AllowedAdminUsers "alice@contoso.org","bob@fabrikam.org"
 ```
 
 What this does:
@@ -106,6 +141,15 @@ allowedAdminUsers:
 
 This yields multi‑tenant sign‑in with app‑level authorization.
 
+Auth policy quick‑set (generate up front)
+
+```powershell
+cd deployment
+./generate-values.ps1 -ResourceGroupName respondr -Domain "<your-domain>" `
+  -AllowedEmailDomains "contoso.org","fabrikam.org" `
+  -AllowedAdminUsers "alice@contoso.org","bob@fabrikam.org"
+```
+
 ## Template‑based deployment (portable config)
 
 Generated at deploy time (not committed):
@@ -120,7 +164,9 @@ Source templates you can read and version:
 Manual template flow (optional):
 ```powershell
 cd deployment
-./generate-values.ps1 -ResourceGroupName respondr -Domain "<your-domain>"
+./generate-values.ps1 -ResourceGroupName respondr -Domain "<your-domain>" `
+  -AllowedEmailDomains "your-org.org","partners.org" `
+  -AllowedAdminUsers "first.admin@your-org.org","second.admin@partners.org"
 ./deploy-template-based.ps1 -ResourceGroupName respondr -Domain "<your-domain>"
 
 # Include ACR webhook setup for automatic redeployments
@@ -270,9 +316,9 @@ Key URLs (replace hosts for your setup)
 - Production: https://respondr.<your-domain> (webhook: `/webhook`, API: `/api/responders`)
 
 Common test flows (from `backend/`)
-- Webhook, local default: `python test_webhook.py`
-- Webhook, production: `python test_webhook.py --production`
-- Preprod smoke and custom message: `python test_preprod.py [--name "Your Name" --message "Your test message"]`
+ - Webhook, local default: `python tests/test_webhook.py`
+ - Webhook, production: `python tests/test_webhook.py --production`
+ - Preprod smoke and custom message: `python tests/test_preprod.py [--name "Your Name" --message "Your test message"]`
 - ACR webhook unit tests: `pytest test_acr_webhook.py -v`
 
 Manual verification (preprod/prod)

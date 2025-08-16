@@ -5,13 +5,16 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Domain,
     
-    [string]$Location = "westus",
+    [string]$Location = "eastus2",
     [string]$Namespace = "respondr",
     [string]$HostPrefix = "respondr",
+    [string]$AppName = "respondr",
     [switch]$SkipInfrastructure,
     [switch]$SkipImageBuild,
     [bool]$UseOAuth2 = $true,
-    [switch]$SetupAcrWebhook
+    [switch]$SetupAcrWebhook,
+    [string[]]$AllowedEmailDomains,
+    [string[]]$AllowedAdminUsers
 )
 
 Write-Host "🚀 Template-Based Respondr Deployment" -ForegroundColor Cyan
@@ -26,7 +29,16 @@ Write-Host ""
 
 # Step 1: Generate values from current environment
 Write-Host "📋 Step 1: Generating configuration from current Azure environment..." -ForegroundColor Green
-& ".\generate-values.ps1" -ResourceGroupName $ResourceGroupName -Domain $Domain -Namespace $Namespace -HostPrefix $HostPrefix
+$genArgs = @{
+    ResourceGroupName   = $ResourceGroupName
+    Domain              = $Domain
+    Namespace           = $Namespace
+    HostPrefix          = $HostPrefix
+}
+if ($AppName) { $genArgs.AppName = $AppName }
+if ($AllowedEmailDomains) { $genArgs.AllowedEmailDomains = $AllowedEmailDomains }
+if ($AllowedAdminUsers)   { $genArgs.AllowedAdminUsers   = $AllowedAdminUsers }
+& ".\generate-values.ps1" @genArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to generate values from environment"
     exit 1
@@ -96,7 +108,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Wait for deployment
 Write-Host "⏳ Waiting for deployment to be ready..." -ForegroundColor Yellow
-kubectl rollout status deployment/respondr-deployment -n $Namespace --timeout=300s
+kubectl rollout status deployment/$AppName-deployment -n $Namespace --timeout=300s
 
 # Step 7: Verification
 Write-Host "✅ Step 7: Verifying deployment..." -ForegroundColor Green
@@ -128,3 +140,5 @@ if ($SetupAcrWebhook) {
     
     & ".\configure-acr-webhook.ps1" -ResourceGroupName $ResourceGroupName -Domain $Domain -Environment $Environment -HostPrefix $HostPrefix
 }
+
+

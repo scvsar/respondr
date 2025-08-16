@@ -6,10 +6,10 @@ param(
     [string]$ResourceGroupName,
     
     [Parameter(Mandatory=$false)]
-    [string]$Domain = "paincave.pro",
+    [string]$Domain = "rtreit.com",
     
     [Parameter(Mandatory=$false)]
-    [string]$AppName = "respondr-oauth2",
+    [string]$AppName,
 
     [Parameter(Mandatory=$false)]
     [string]$Namespace = "respondr",
@@ -21,6 +21,13 @@ param(
 Write-Host "Setting up OAuth2 Proxy with Azure AD integration..." -ForegroundColor Green
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor Cyan
 Write-Host "Domain: $Domain" -ForegroundColor Cyan
+
+# Set default app name based on domain and host prefix if not provided
+if (-not $AppName) {
+    $AppName = "$HostPrefix-$($Domain.Replace('.', '-'))-oauth2"
+}
+
+Write-Host "App Name: $AppName" -ForegroundColor Cyan
 
 # Get tenant ID
 $tenantId = az account show --query tenantId -o tsv
@@ -44,21 +51,9 @@ if ($existingApp) {
     Write-Host "Found existing app registration: $($existingApp.displayName)" -ForegroundColor Green
     $appId = $existingApp.appId
     
-    # Update to multi-tenant and ensure redirect URI is included (append if missing)
-    Write-Host "Updating app to multi-tenant and ensuring redirect URI exists..." -ForegroundColor Yellow
-    $current = az ad app show --id $appId -o json | ConvertFrom-Json
-    $existingUris = @()
-    try { $existingUris = @($current.web.redirectUris) } catch { $existingUris = @() }
-    if (-not ($existingUris -contains $redirectUri)) {
-        $newUris = @($existingUris + @($redirectUri) | Where-Object { $_ })
-    } else {
-        $newUris = $existingUris
-    }
-    if ($newUris.Count -gt 0) {
-        az ad app update --id $appId --sign-in-audience "AzureADMultipleOrgs" --web-redirect-uris $newUris 2>$null
-    } else {
-        az ad app update --id $appId --sign-in-audience "AzureADMultipleOrgs" --web-redirect-uris $redirectUri 2>$null
-    }
+    # Update redirect URI
+    Write-Host "Updating redirect URI..." -ForegroundColor Yellow
+    az ad app update --id $appId --web-redirect-uris $redirectUri 2>$null
 } else {
     # Create new app registration
     Write-Host "Creating new Azure AD app registration..." -ForegroundColor Yellow
@@ -100,6 +95,7 @@ kubectl -n $Namespace create secret generic oauth2-secrets `
     --from-literal=client-id=$appId `
     --from-literal=client-secret=$clientSecret `
     --from-literal=cookie-secret=$cookieSecret `
+    --from-literal=tenant-id=$tenantId `
     --dry-run=client -o yaml | kubectl apply -f -
 
 if ($LASTEXITCODE -eq 0) {

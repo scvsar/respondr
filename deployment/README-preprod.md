@@ -2,6 +2,8 @@
 
 This repo supports deploying a separate pre-production environment into its own Kubernetes namespace and DNS host on the same Application Gateway/Public IP.
 
+Use `deploy-complete.ps1` with pre-production parameters for the simplest end-to-end flow. Helper scripts that previously duplicated this logic have been archived under `_attic/`.
+
 ## Overview
 
 **Key Features:**
@@ -51,7 +53,9 @@ If you need to debug or customize:
 
 ```powershell
 # 1. Generate configuration
-.\generate-values.ps1 -ResourceGroupName respondr -Domain rtreit.com -Namespace respondr-preprod -HostPrefix preprod -ImageTag preprod
+\.\generate-values.ps1 -ResourceGroupName respondr -Domain rtreit.com -Namespace respondr-preprod -HostPrefix preprod -ImageTag preprod `
+  -AllowedEmailDomains "scvsar.org","rtreit.com" `
+  -AllowedAdminUsers "you@scvsar.org","admin@rtreit.com"
 
 # 2. Process template
 .\process-template.ps1 -TemplateFile respondr-k8s-unified-template.yaml -OutputFile respondr-k8s-generated.yaml
@@ -84,6 +88,22 @@ git push origin preprod
 ```
 
 Then manually deploy using Method 1 or 2 with the built images.
+
+### Customize auth policy at generation time
+
+The values generator accepts optional parameters so you don’t have to hand‑edit `values.yaml`:
+
+```powershell
+cd deployment
+./generate-values.ps1 -ResourceGroupName respondr -Domain rtreit.com -Namespace respondr-preprod -HostPrefix preprod -ImageTag preprod `
+  -AllowedEmailDomains "contoso.org","fabrikam.org" `
+  -AllowedAdminUsers "alice@contoso.org","bob@fabrikam.org"
+```
+
+Notes
+- If you omit `-AllowedEmailDomains`, it defaults to `scvsar.org` and `rtreit.com`.
+- If you omit `-AllowedAdminUsers`, it will be empty (no admins) until you add them.
+- You can always edit the lists later in `deployment/values.yaml` under `allowedEmailDomains` and `allowedAdminUsers` and then re-run `process-template.ps1`.
 
 ### OIDC Setup for GitHub Actions
 
