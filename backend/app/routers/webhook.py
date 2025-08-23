@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 import uuid
 
-from ..config import webhook_api_key, disable_api_key_check, APP_TZ, GROUP_ID_TO_TEAM
+from ..config import webhook_api_key, disable_api_key_check, APP_TZ, GROUP_ID_TO_TEAM, DEBUG_LOG_HEADERS
 from ..llm import extract_details_from_text, build_prompts
 from ..utils import parse_datetime_like
 from ..storage import add_message, get_messages
@@ -51,9 +51,25 @@ def verify_api_key(api_key: Optional[str] = None):
 
 
 @router.post("/webhook")
-async def webhook_handler(message: WebhookMessage, request: Request, debug: bool = Query(default=False)):
+async def webhook_handler(message: WebhookMessage, request: Request, debug: bool = Query(default=False)) -> Dict[str, Any]:
     """Handle incoming webhook messages from GroupMe."""
     try:
+        # Optional: log incoming headers and raw body when DEBUG_LOG_HEADERS is enabled
+        if DEBUG_LOG_HEADERS:
+            try:
+                logger.debug("=== DEBUG: Webhook headers ===")
+                for hn, hv in request.headers.items():
+                    logger.debug(f"Header: {hn} = {hv}")
+                # Read raw body safely; request.json() / pydantic already parsed message
+                raw_body = await request.body()
+                if raw_body:
+                    try:
+                        logger.debug(f"=== DEBUG: Webhook raw body ===\n{raw_body.decode('utf-8', errors='replace')}\n=== END RAW BODY ===")
+                    except Exception:
+                        logger.debug("=== DEBUG: Webhook raw body present but could not decode ===")
+            except Exception as e:
+                logger.debug(f"Failed to log raw webhook headers/body: {e}")
+
         # Parse timestamp
         message_dt = parse_datetime_like(message.created_at) or datetime.now(APP_TZ)
         # Determine team from group_id early so we can scope history lookup
